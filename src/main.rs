@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
-#[allow(unused_imports)]
-use std::net::TcpListener;
+
+use smol::io::{AsyncReadExt, AsyncWriteExt, Result};
+use smol::net::{TcpListener, TcpStream};
 
 #[derive(Debug)]
 struct Request {
@@ -10,64 +10,46 @@ struct Request {
     headers: HashMap<String, String>,
 }
 
-fn main() {
+fn main() -> Result<()> {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
 
-    let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
+    smol::block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:4221").await?;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                println!("accepted new connection");
-
-                let mut buffer = [0; 1024];
-                let bytes_read = stream.read(&mut buffer).unwrap();
-                let request_bytes = &buffer[..bytes_read];
-
-                match parse_request(request_bytes) {
-                    Ok(req) => {
-                        println!("Parsed request: {:#?}", req);
-                        if req.path == "/" {
-                            _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
-                        } else if req.path.starts_with("/echo/") {
-                            let echo_str = &req.path["/echo/".len()..];
-                            let len = echo_str.len();
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                                len, echo_str
-                            );
-                            _ = stream.write_all(response.as_bytes());
-                        } else if req.path == "/user-agent" {
-                            match req.headers.get("User-Agent") {
-                                Some(agent) => {
-                                    let response = format!(
-                                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                                        agent.len(),
-                                        agent
-                                    );
-                                    _ = stream.write_all(response.as_bytes());
-                                }
-                                None => _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n"),
-                            }
-                        } else {
-                            _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n");
-                        }
-                    }
-                    Err(e) => {
-                        println!("Failed to parse request: {}", e);
-                        _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
-                    }
-                }
-            }
-            Err(e) => {
-                println!("error: {}", e);
-            }
+        loop {
+            let (stream, _) = listener.accept().await?;
+            smol::spawn(handle_connection(stream)).detach();
         }
-    }
+    })
 }
 
-fn parse_request(request: &[u8]) -> Result<Request, String> {
+async fn handle_connection(mut stream: TcpStream) -> smol::io::Result<()> {
+    println!("accepted new connection");
+
+    let mut buffer = [0; 1024];
+    let bytes_read = stream.read(&mut buffer).await?;
+    let request_bytes = &buffer[..bytes_read];
+
+    match parse_request(request_bytes) {
+        Ok(req) => {
+            println!("Parsed request: {:#?}", req);
+            match req.method.as_str() {
+                "GET" => handle_get(&req, &mut stream).await?,
+                _ => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?,
+            }
+        }
+        Err(e) => {
+            println!("Failed to parse request: {}", e);
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_request(request: &[u8]) -> std::result::Result<Request, String> {
     let request_str = std::str::from_utf8(request).map_err(|e| format!("Invalid UTF-8: {}", e))?;
 
     let mut lines = request_str.split("\r\n");
@@ -95,4 +77,34 @@ fn parse_request(request: &[u8]) -> Result<Request, String> {
         path,
         headers,
     })
+}
+
+async fn handle_get(req: &Request, stream: &mut TcpStream) -> Result<()> {
+    if req.path == "/" {
+        stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
+    } else if req.path.starts_with("/echo/") {
+        let echo_str = &req.path["/echo/".len()..];
+        let len = echo_str.len();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            len, echo_str
+        );
+        stream.write_all(response.as_bytes()).await?;
+    } else if req.path == "/user-agent" {
+        match req.headers.get("User-Agent") {
+            Some(agent) => {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    agent.len(),
+                    agent
+                );
+                stream.write_all(response.as_bytes()).await?;
+            }
+            None => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?,
+        }
+    } else {
+        stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?;
+    }
+
+    Ok(())
 }
