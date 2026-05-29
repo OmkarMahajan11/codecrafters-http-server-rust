@@ -1,7 +1,13 @@
-use std::collections::HashMap;
-
+use smol::fs::File;
 use smol::io::{AsyncReadExt, AsyncWriteExt, Result};
 use smol::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::env;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 #[derive(Debug)]
 struct Request {
@@ -10,17 +16,74 @@ struct Request {
     headers: HashMap<String, String>,
 }
 
+pub static DIR: OnceLock<String> = OnceLock::new();
+
 fn main() -> Result<()> {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
+    let args = env::args().skip(1).collect::<Vec<String>>();
+
+    let dir = match args.windows(2).find(|w| w[0] == "--directory") {
+        Some(w) => w[1].clone(),
+        None => {
+            if args.last().map_or(false, |arg| arg == "--directory") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--directory flag given without a value",
+                ));
+            }
+            String::new()
+        }
+    };
+
+    if dir != "" {
+        std::fs::create_dir_all(&dir).expect("Could not create directory");
+        DIR.set(dir).expect("Failed to set global var");
+    }
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_signal = shutdown.clone();
+
+    ctrlc::set_handler(move || {
+        println!("Shutting down...");
+        shutdown_signal.store(true, Ordering::Relaxed);
+    })
+    .expect("Error setting Ctrl-C handler");
 
     smol::block_on(async {
         let listener = TcpListener::bind("127.0.0.1:4221").await?;
+        let active_connections = Arc::new(AtomicUsize::new(0));
 
         loop {
-            let (stream, _) = listener.accept().await?;
-            smol::spawn(handle_connection(stream)).detach();
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let counter = active_connections.clone();
+                    counter.fetch_add(1, Ordering::Relaxed);
+
+                    smol::spawn(async move {
+                        if let Err(e) = handle_connection(stream).await {
+                            eprintln!("Handle connection error: {}", e);
+                        }
+                        counter.fetch_sub(1, Ordering::Relaxed);
+                    })
+                    .detach();
+                }
+                Err(e) => {
+                    eprintln!("Listener accept error: {}", e);
+                }
+            }
         }
+
+        println!("Waiting for all connection to close...");
+        while active_connections.load(Ordering::Relaxed) > 0 {
+            smol::Timer::after(Duration::from_millis(50)).await;
+        }
+
+        println!("All connections closed. Shutting down.");
+
+        Ok(())
     })
 }
 
@@ -80,30 +143,59 @@ fn parse_request(request: &[u8]) -> std::result::Result<Request, String> {
 }
 
 async fn handle_get(req: &Request, stream: &mut TcpStream) -> Result<()> {
-    if req.path == "/" {
-        stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
-    } else if req.path.starts_with("/echo/") {
-        let echo_str = &req.path["/echo/".len()..];
-        let len = echo_str.len();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-            len, echo_str
-        );
-        stream.write_all(response.as_bytes()).await?;
-    } else if req.path == "/user-agent" {
-        match req.headers.get("User-Agent") {
+    let path = req.path.as_str();
+
+    match path {
+        "/" => {
+            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
+        }
+        "/user-agent" => match req.headers.get("User-Agent") {
             Some(agent) => {
-                let response = format!(
+                let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
                     agent.len(),
                     agent
                 );
-                stream.write_all(response.as_bytes()).await?;
+                stream.write_all(resp.as_bytes()).await?;
             }
             None => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?,
+        },
+        p if p.starts_with("/echo/") => {
+            let echo_str = &p["/echo/".len()..];
+            let len = echo_str.len();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                len, echo_str
+            );
+            stream.write_all(resp.as_bytes()).await?;
         }
-    } else {
-        stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?;
+        p if p.starts_with("/files/") => {
+            let dir = DIR.get().expect("Expected a directory value");
+            if dir == "" {
+                stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?;
+                return Ok(());
+            }
+            let file_str = &p["/files/".len()..];
+            let path_str = format!("{}/{}", dir, file_str);
+            let path = Path::new(&path_str);
+
+            let mut buf = String::new();
+            match File::open(path).await {
+                Ok(mut f) => {
+                    f.read_to_string(&mut buf).await?;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n{}",
+                        buf.len(),
+                        &buf
+                    );
+                    stream.write_all(resp.as_bytes()).await?;
+                }
+                Err(_) => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?,
+            }
+        }
+        _ => {
+            stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?;
+        }
     }
 
     Ok(())
