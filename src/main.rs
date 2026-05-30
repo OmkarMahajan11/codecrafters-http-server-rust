@@ -1,4 +1,5 @@
 use futures::future::{Either, select};
+use smol::channel::bounded;
 use smol::fs::File;
 use smol::io::{AsyncReadExt, AsyncWriteExt, Result};
 use smol::net::{TcpListener, TcpStream};
@@ -8,7 +9,7 @@ use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -42,13 +43,11 @@ fn main() -> Result<()> {
         DIR.set(dir).expect("Failed to set global var");
     }
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_signal = shutdown.clone();
+    let (shutdown_tx, shutdown_rx) = bounded(1);
 
     ctrlc::set_handler(move || {
         println!("Shutting down...");
-        shutdown_signal.store(true, Ordering::Relaxed);
-        let _ = std::net::TcpStream::connect("127.0.0.1:4221");
+        let _ = shutdown_tx.try_send(());
     })
     .expect("Error setting Ctrl-C handler");
 
@@ -58,11 +57,7 @@ fn main() -> Result<()> {
 
         loop {
             let accept_fut = pin!(listener.accept());
-            let shutdown_fut = pin!(async {
-                while !shutdown.load(Ordering::Relaxed) {
-                    smol::Timer::after(Duration::from_millis(100)).await;
-                }
-            });
+            let shutdown_fut = pin!(shutdown_rx.recv());
 
             match select(accept_fut, shutdown_fut).await {
                 Either::Left((Ok((stream, _)), _)) => {
