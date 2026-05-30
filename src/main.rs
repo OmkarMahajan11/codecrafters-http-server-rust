@@ -14,6 +14,7 @@ struct Request {
     method: String,
     path: String,
     headers: HashMap<String, String>,
+    body: Option<String>,
 }
 
 pub static DIR: OnceLock<String> = OnceLock::new();
@@ -96,9 +97,10 @@ async fn handle_connection(mut stream: TcpStream) -> smol::io::Result<()> {
 
     match parse_request(request_bytes) {
         Ok(req) => {
-            println!("Parsed request: {:#?}", req);
+            //println!("Parsed request: {:#?}", req);
             match req.method.as_str() {
                 "GET" => handle_get(&req, &mut stream).await?,
+                "POST" => handle_post(&req, &mut stream).await?,
                 _ => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?,
             }
         }
@@ -117,28 +119,26 @@ fn parse_request(request: &[u8]) -> std::result::Result<Request, String> {
 
     let mut lines = request_str.split("\r\n");
 
-    // Parse request line: METHOD PATH VERSION
-    let request_line = lines.next().ok_or("Empty request")?;
+    let request_line = lines.next().take().ok_or("Empty request")?;
     let mut request_parts = request_line.split_whitespace();
 
     let method = request_parts.next().ok_or("Missing method")?.to_string();
     let path = request_parts.next().ok_or("Missing path")?.to_string();
 
-    // Parse headers
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((key, value)) = line.split_once(": ") {
-            headers.insert(key.to_string(), value.to_string());
-        }
-    }
+    let headers = lines
+        .by_ref()
+        .take_while(|l| l.contains(": "))
+        .filter_map(|l| l.split_once(": "))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let body = lines.last().map(String::from);
 
     Ok(Request {
         method,
         path,
         headers,
+        body,
     })
 }
 
@@ -175,6 +175,7 @@ async fn handle_get(req: &Request, stream: &mut TcpStream) -> Result<()> {
                 stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?;
                 return Ok(());
             }
+
             let file_str = &p["/files/".len()..];
             let path_str = format!("{}/{}", dir, file_str);
             let path = Path::new(&path_str);
@@ -198,5 +199,36 @@ async fn handle_get(req: &Request, stream: &mut TcpStream) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn handle_post(req: &Request, stream: &mut TcpStream) -> Result<()> {
+    match &req.path {
+        p if p.starts_with("/files/") => {
+            let dir = DIR.get().expect("Expected a directory value");
+            let file_str = &p["/files/".len()..];
+
+            let path_str = format!("{}/{}", dir, file_str);
+            let path = Path::new(&path_str);
+            match File::create(path).await {
+                Ok(mut f) => {
+                    if let Some(s) = &req.body
+                        && s != ""
+                    {
+                        f.write_all(s.as_bytes()).await?;
+                        f.flush().await?
+                    }
+                    stream.write_all(b"HTTP/1.1 201 Created\r\n\r\n").await?;
+                }
+                Err(e) => {
+                    println!("Could not create file: {}, error: {}", file_str, e);
+                    stream
+                        .write_all(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
+                        .await?
+                }
+            }
+        }
+        _ => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?,
+    }
     Ok(())
 }
