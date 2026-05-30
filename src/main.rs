@@ -1,9 +1,11 @@
+use futures::future::{Either, select};
 use smol::fs::File;
 use smol::io::{AsyncReadExt, AsyncWriteExt, Result};
 use smol::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -46,6 +48,7 @@ fn main() -> Result<()> {
     ctrlc::set_handler(move || {
         println!("Shutting down...");
         shutdown_signal.store(true, Ordering::Relaxed);
+        let _ = std::net::TcpStream::connect("127.0.0.1:4221");
     })
     .expect("Error setting Ctrl-C handler");
 
@@ -54,12 +57,15 @@ fn main() -> Result<()> {
         let active_connections = Arc::new(AtomicUsize::new(0));
 
         loop {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
+            let accept_fut = pin!(listener.accept());
+            let shutdown_fut = pin!(async {
+                while !shutdown.load(Ordering::Relaxed) {
+                    smol::Timer::after(Duration::from_millis(100)).await;
+                }
+            });
 
-            match listener.accept().await {
-                Ok((stream, _)) => {
+            match select(accept_fut, shutdown_fut).await {
+                Either::Left((Ok((stream, _)), _)) => {
                     let counter = active_connections.clone();
                     counter.fetch_add(1, Ordering::Relaxed);
 
@@ -71,8 +77,11 @@ fn main() -> Result<()> {
                     })
                     .detach();
                 }
-                Err(e) => {
+                Either::Left((Err(e), _)) => {
                     eprintln!("Listener accept error: {}", e);
+                }
+                Either::Right(_) => {
+                    break;
                 }
             }
         }
@@ -93,6 +102,10 @@ async fn handle_connection(mut stream: TcpStream) -> smol::io::Result<()> {
 
     let mut buffer = [0; 1024];
     let bytes_read = stream.read(&mut buffer).await?;
+    if bytes_read == 0 {
+        return Ok(());
+    }
+
     let request_bytes = &buffer[..bytes_read];
 
     match parse_request(request_bytes) {
